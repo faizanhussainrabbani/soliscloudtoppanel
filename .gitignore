@@ -1,0 +1,21 @@
+# Swift Package Manager build products. 523 MB of it at last count.
+.build/
+.swiftpm/
+Package.resolved
+
+# Output of build.sh; --install copies this to /Applications and deletes it,
+# but a plain ./build.sh leaves it behind.
+dist/
+
+# Finder metadata. There were four of these in the tree, one inside Sources/.
+.DS_Store
+
+# Xcode, if anyone opens the package in it
+*.xcuserstate
+xcuserdata/
+*.xcodeproj/project.xcworkspace/
+DerivedData/
+
+# Diagnostic captures. The panel log contains no credentials, but it does
+# record station name, coordinates-derived sun times and consumption.
+*.log
