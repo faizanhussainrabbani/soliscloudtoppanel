@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only. Nothing here needs write access to the repository, and a token
+# that can't write can't be turned against it.
+permissions:
+  contents: read
+
+# A superseded run tells you nothing useful, and macOS minutes are the
+# expensive kind.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    # macOS is not optional: the package targets .macOS(.v14) and imports
+    # AppKit, SwiftUI and WebKit, none of which exist on a Linux runner.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      # Release, matching build.sh, and warnings are errors.
+      #
+      # This is a real gate rather than an aspiration: the tree builds clean
+      # under -warnings-as-errors today, verified locally before this workflow
+      # was written. If it ever fails, something genuinely regressed.
+      - name: Build (warnings are errors)
+        run: swift build -c release -Xswiftc -warnings-as-errors
+
+      # The bundle is what actually ships, and it exercises the parts plain
+      # `swift build` doesn't: Info.plist copying, the icon, ad-hoc signing.
+      # WKWebView and UNUserNotificationCenter both refuse to run unsigned, so a
+      # signing failure is a real failure even though nothing launches in CI.
+      - name: Assemble and sign the app bundle
+        run: ./build.sh
+
+      - name: Verify the signature
+        run: codesign --verify --verbose dist/SolisSolarMonitor.app
+
+  secrets:
+    name: Credential guard
+    # Only greps tracked files, so the cheapest runner is fine.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for credentials and account data
+        run: ./scripts/check-secrets.sh
+
+  lint:
+    name: SwiftLint
+    runs-on: macos-latest
+    # NOT a gate yet, deliberately.
+    #
+    # SwiftLint could not be run locally to see what it says about this code —
+    # it needs sourcekitd from a full Xcode, and this machine has only the
+    # Command Line Tools, where it crashes on load. Making an unverified linter
+    # blocking would mean shipping a red build and finding out afterwards.
+    #
+    # Read the first few runs, tune or add .swiftlint.yml if it's noisy, then
+    # delete this line to make it enforce.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SwiftLint
+        run: brew install swiftlint
+      - name: Lint
+        run: swiftlint lint --reporter github-actions-logging

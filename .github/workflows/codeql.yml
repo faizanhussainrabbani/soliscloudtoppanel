@@ -1,0 +1,45 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so new query packs get applied to code that hasn't changed.
+    # Findings often arrive from CodeQL improving rather than the code moving.
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # required to upload results to the Security tab
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze Swift
+    # Swift analysis requires macOS; CodeQL will not build this on Linux.
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: swift
+          # Manual, not autobuild: this is a SwiftPM package with a macOS
+          # deployment target, and the explicit command is the same one CI
+          # already proves works.
+          build-mode: manual
+
+      - name: Build for analysis
+        run: swift build -c debug
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:swift

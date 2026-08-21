@@ -126,6 +126,22 @@ inverter detail on a throttle, plus ~8 to Open-Meteo. Polling faster than a few
 minutes gains nothing: the upstream reading only changes every few minutes, and
 at a 10-second interval 15 of 16 polls returned a byte-identical result.
 
+## Continuous integration
+
+Two workflows run on push and pull request:
+
+- **CI** — builds release with `-warnings-as-errors`, assembles and ad-hoc signs
+  the app bundle, verifies the signature, and runs a credential guard over every
+  tracked file. SwiftLint also runs but is advisory for now.
+- **CodeQL** — Swift security analysis, plus a weekly scheduled run so new query
+  packs get applied to code that hasn't changed.
+
+The credential guard (`scripts/check-secrets.sh`) is specific to this project
+rather than a generic scanner, because the thing that nearly leaked — a 32-char
+hex signing secret and a session cookie — matches no known provider pattern.
+Every check is verified in both directions: it passes on a clean tree, and each
+pattern was confirmed to actually fire against a planted fake.
+
 ## Known limitations
 
 **This uses an undocumented API.** It reads a browser session rather than an
