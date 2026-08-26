@@ -235,7 +235,18 @@ enum SolisAPI {
 
             NSLog("SolisSolarMonitor API Code: \(code), Msg: \(json.str("msg") ?? "")")
 
-            if code == "401" || code == "403" || code == "B0049" {
+            // Z0001 is SolisCloud's "Login has expired. Please login again",
+            // which is a session problem wearing an opaque code. It was missing
+            // from this list, so a plain expiry surfaced in the menu bar as
+            // "API Error (Z0001)" — cryptic, and it bypassed the session flow
+            // that stops polling and offers a sign-in.
+            //
+            // The message is also matched, because the code list is
+            // undocumented and guessing the next one wrong has the same cost.
+            let expiredMessage = (json.str("msg") ?? "").lowercased()
+            if code == "401" || code == "403" || code == "B0049" || code == "Z0001"
+                || expiredMessage.contains("login has expired")
+                || expiredMessage.contains("please login") {
                 return .sessionExpired
             }
             return .apiError("API Error (\(code.isEmpty ? "Err" : code))")

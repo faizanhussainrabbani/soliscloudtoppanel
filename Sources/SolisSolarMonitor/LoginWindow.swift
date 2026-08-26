@@ -232,19 +232,56 @@ final class LoginWindowController: NSObject, ObservableObject, WKNavigationDeleg
         settings.authorization = authorization
 
         // Pull the real cookie jar — HttpOnly cookies are invisible to page JS.
+        captureCookies(attempt: 0)
+    }
+
+    /// Waits for the session cookie, rather than taking whatever is in the jar
+    /// the moment the first API call is seen.
+    ///
+    /// The previous version captured once, on the first intercepted request, and
+    /// declared success unconditionally. If the `token` cookie hadn't been set
+    /// yet — it arrives slightly after the navigation that triggers this — it
+    /// stored the analytics cookies alone (`_ga`, `_ga_F1LKTQM2DR`, `acw_tc`),
+    /// showed "✅ Session credentials captured!", and closed. Every request
+    /// afterwards returned Z0001 "Login has expired", and signing in again
+    /// reproduced it exactly, because the same race resolved the same way.
+    ///
+    /// So the token is now a precondition for success, and its absence is a
+    /// reason to keep waiting rather than to celebrate.
+    private func captureCookies(attempt: Int) {
         webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
             Task { @MainActor in
                 guard let self, !self.captured else { return }
 
                 let relevant = cookies.filter { $0.domain.contains("soliscloud.com") }
+                let hasSessionToken = relevant.contains { $0.name == "token" }
+
+                guard hasSessionToken else {
+                    // ~20 s of grace, then say so plainly instead of storing a
+                    // session that cannot work.
+                    if attempt >= 40 {
+                        self.infoBannerText = "⚠️ Logged in, but no session cookie appeared. "
+                            + "Open your station page, or try signing in again."
+                        self.statusIcon = "⚠️"
+                        NSLog("%@", "SolisPrefs: gave up waiting for the token cookie; "
+                            + "saw only \(relevant.map(\.name).joined(separator: ", "))")
+                        return
+                    }
+                    self.infoBannerText = "⏳ Logged in — waiting for the session cookie…"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                        self?.captureCookies(attempt: attempt + 1)
+                    }
+                    return
+                }
+
                 let cookieString = relevant
                     .map { "\($0.name)=\($0.value)" }
                     .joined(separator: "; ")
 
-                guard !cookieString.isEmpty else { return }
-
                 self.settings.cookie = cookieString
-                NSLog("SolisPrefs: Captured — \(relevant.count) cookies, device-id: \(self.capturedDeviceID)")
+                NSLog("%@", "SolisPrefs: captured \(relevant.count) cookies "
+                    + "(\(relevant.map(\.name).sorted().joined(separator: ", "))), "
+                    + "device-id \(self.capturedDeviceID.isEmpty ? "missing" : "present")")
 
                 self.captured = true
                 self.infoBannerVisible = false

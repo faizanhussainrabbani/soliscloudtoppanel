@@ -1,0 +1,10 @@
+{
+  "name": "solis-battery-alerts",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/main.js",
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "node-appwrite": "^18.0.0"
+  }
+}

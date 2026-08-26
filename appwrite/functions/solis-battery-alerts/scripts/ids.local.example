@@ -1,0 +1,5 @@
+# Copy to ids.local and fill in from the Appwrite console. Gitignored: these are
+# account-specific, and this project keeps nothing account-specific in source.
+APPWRITE_DATABASE_ID=
+APPWRITE_TABLE_ID=
+ALERT_USER_IDS=
