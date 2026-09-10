@@ -286,3 +286,36 @@ func powerParts(_ kW: Double) -> (value: String, unit: String) {
     guard pieces.count == 2 else { return (text, "") }
     return (String(pieces[0]), String(pieces[1]))
 }
+
+// MARK: - Station-local calendar days
+
+/// "yyyy-MM-dd" for an instant, in the *station's* timezone rather than the
+/// Mac's.
+///
+/// Same reasoning as the peak window in SolarForecast: the panels and the
+/// battery keep the station's calendar, so a Mac in another zone (or one
+/// carried across one) must not split a day in the wrong place. Keyed off
+/// SolisCloud's `dataTimestamp`, which was verified to be a true UTC epoch —
+/// 1788251642539 renders as 13:34:02 UTC+05:00 and as 08:34:02 UTC, so it is
+/// not pre-shifted into the station zone the way some fields in this API are.
+func stationDayKey(_ date: Date, utcOffsetSeconds: Int) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone(secondsFromGMT: utcOffsetSeconds) ?? .current
+    f.dateFormat = "yyyy-MM-dd"
+    return f.string(from: date)
+}
+
+/// Whole days between two `stationDayKey` values, or nil if either won't parse.
+///
+/// Both arguments are plain calendar dates, so the zone used to parse them is
+/// arbitrary as long as it's the same for both — hence a fixed UTC formatter
+/// rather than the station's offset, which would need threading through.
+func dayGap(from earlier: String, to later: String) -> Int? {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone(secondsFromGMT: 0)
+    f.dateFormat = "yyyy-MM-dd"
+    guard let a = f.date(from: earlier), let b = f.date(from: later) else { return nil }
+    return Int(((b.timeIntervalSince1970 - a.timeIntervalSince1970) / 86400).rounded())
+}

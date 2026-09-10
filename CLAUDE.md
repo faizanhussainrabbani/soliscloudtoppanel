@@ -65,7 +65,7 @@ Sources/SolisSolarMonitor/
   PreferencesView.swift  Setup / Display tabs
   LoginWindow.swift      embedded WKWebView login + credential capture
   Notifier.swift         grid outage/restore + low-battery notifications
-  Util.swift             formatting, sun times, dynamic Color pairs
+  Util.swift             formatting, sun times, station-local day keys, Colors
 IconGen/main.swift       generates Resources/AppIcon.icns
 build.sh                 builds, ad-hoc signs, optionally installs to /Applications
 ```
@@ -136,8 +136,8 @@ today's totals; "Battery Idle" sat beside a projection):
   (daytime, forecast) or Vs average (after dark, actual)
 - **AHEAD** — Peak window (today's, or tomorrow's once the sun is down),
   Sunset/Sunrise, On battery until / Full at
-- **EQUIPMENT** — Battery flow, Inverter temperature, and an alarm row when one
-  is active
+- **EQUIPMENT** — Battery flow, Full charge (when the pack last topped out),
+  Inverter temperature, and an alarm row when one is active
 
 Then the reading's own timestamp, ungrouped and last, because it is metadata
 about the panel rather than a fact about the system.
@@ -256,6 +256,187 @@ app showed what looked like an error whenever the battery rested.
 Not "empty by": with a cut-off set, that moment is when the inverter stops
 supporting the house, not when the battery is flat.
 
+### Full charge tracking
+
+`recordFullCharge` keeps two high-water marks per station-local day —
+`settings.socDayPeaks` and `settings.voltageDayPeaks` — and the EQUIPMENT row
+"Full charge" reports when the pack last genuinely topped out: "3 days ago ·
+81% today", "3 days ago · 100% by count only", or "None in 21 recorded days".
+
+**Two marks, and that is the whole point.** SOC drifts, so it can creep to 100%
+while the pack sits at the float setpoint and the cells never rise far enough to
+balance. Peak *voltage* is the physical evidence. Observed live: SOC 97% with
+the pack at 53.52 V, i.e. exactly `batteryFcvSet`, 2.6 V under absorption.
+
+**Voltage leads; SOC corroborates.** A day counts as a real top-out if peak
+voltage cleared `FullCharge.absorptionThreshold` — the midpoint between
+`batteryFcvSet` and `batteryAcvSet` — *and* peak SOC reached
+`nearFullSOC` (95). With no usable voltage evidence it falls back to SOC alone
+and demands a full `fullSOC` (100).
+
+That split is a correction, and the reason matters. It was originally
+`SOC >= 100 AND voltage >= threshold`, which was right while SOC came from the
+BMS and was coulomb-counted. Once support switched the inverter to "Without
+COMM" (see below) SOC became a voltage inference with a few points of error —
+it read a spurious 100 during a BMS re-init on 2 Sep, and 99 on 6 Sep on a day
+the pack demonstrably reached 55.0 V. The old rule let that soft estimate veto
+hard voltage evidence, and the row claimed "2 days ago" the morning after a real
+absorption charge.
+
+**SOC is still checked, and not vestigially.** It guards the one case voltage
+alone gets wrong: terminal voltage lifted over the threshold by a heavy charge
+current part-way up the pack. That is tens of SOC points short of full, not
+five, so 95 rejects it while absorbing the observed drift.
+
+The midpoint, not "within X of absorption": it is self-scaling, and float
+actively holds the pack at `fcv`, so a pack cannot drift halfway to absorption
+by accident. Clearing it means the inverter deliberately pushed it there.
+
+Voltage comes from `storageBatteryVoltage` in station/detailMix — **no extra
+request**, sampled every poll. That is the *inverter's* meter, not the BMS's
+`batteryVoltage`, deliberately: it is compared against the inverter's own
+setpoints and the two meters read ~0.2 V apart, so both sides of the comparison
+share a reference frame.
+
+**Three exemptions, all the same principle — never claim what the evidence
+can't support:**
+
+- Setpoints unknown (they arrive on the throttled /inverter/detail fetch) →
+  judge on SOC alone.
+- A day with no voltage record at all → not demoted. Absence of evidence is not
+  evidence the charge was incomplete.
+- **The earliest day in the voltage record is exempt**, derived from
+  `voltagePeaks.keys.min()`. Recording starts mid-day, so that day's mark covers
+  only the hours after the app first ran; a pack that absorbed at 11:00 and was
+  back at float by 16:00 would be demoted on evidence that was never collected,
+  making the feature's first impression a false alarm.
+
+The row says "by count only" rather than printing the voltage, because "53.6 V"
+only informs a reader who already knows the 56.1 V setpoint. State the
+conclusion, not the raw evidence.
+
+**The row is hidden on a day the pack did reach 100%**, because "Full charge:
+Today" asks nothing of the reader, and a row that says the same thing every day
+stops being read — so it would be invisible on the day it finally said "9 days
+ago". Same principle as the status line. It is deliberately *not* hidden for
+the whole `recentDays` window: a gap is worth seeing while it is still small,
+and suppressing it for a week means it reappears at day eight with no sense of
+whether it is drifting or was fine yesterday. **The recording continues
+regardless of what is displayed** — hiding the row must never stop the history.
+
+Why it exists: LiFePO4 balances its cells and re-anchors the BMS's SOC estimate
+at the top of charge. This system rides through roughly **five grid outages a
+day** (1547 NO-Grid records in the alarm history), so reaching 100% is not
+something that can be assumed — and neither the app nor SolisCloud's own site
+would have said so.
+
+- **The threshold is 100, not `Curtailment.fullSOC`'s 98, and that is
+  deliberate.** Curtailment asks "is the pack full enough that the inverter is
+  throttling the array", where 98 is close enough. This asks "did the pack
+  actually reach the top of charge", and a charge that stops at 98 is precisely
+  the one that didn't. Two constants, two questions — don't unify them.
+- **Days are keyed to the station's timezone**, from `dataTimestamp` plus the
+  response's `timeZone`. Verified that `dataTimestamp` is a true UTC epoch
+  (1788251642539 renders as 13:34:02 UTC+05:00 *and* 08:34:02 UTC), unlike some
+  fields in this API which arrive pre-shifted.
+- **"No full charge" and "not enough history" are different rows.** Below
+  `minimumRecordDays = 14` it reports the record's length instead of making a
+  claim about the battery. There is nothing to backfill from — `/station/day`,
+  `/inverter/day`, `/battery/pile/chart` and six siblings all 404 — so a fresh
+  install genuinely cannot distinguish the two, and stating the first on the
+  evidence for the second is the assume-one-cause bug from the list below.
+- **Record length counts observed days, not the span since the first entry.** A
+  fortnight with the Mac switched off is not a fortnight of evidence.
+- Only recorded when `batteryPercent` was actually present; the `?? 0` fallback
+  would otherwise write a 0 peak and manufacture a record day with no battery
+  data in it.
+- No new colour meaning: the icon follows the existing dim rule (lit when a
+  full charge is within `recentDays = 7`), rather than adding a third semantic
+  amber alongside low-battery red and stale-data amber. The lit state is still
+  reachable — days 1 to 7 show the row *and* light it.
+
+Verified with a 24-scenario proxy (`recordFullCharge` copied verbatim, the two
+settings stores swapped for injected dictionaries), 6 pruning cases, and a
+14-case suite for the voltage-leads rule that replays the real 01–07 Sep
+history out of `defaults`.
+**Delete the proxy binary before rebuilding it** — a compile failure otherwise
+runs the previous binary and prints a full page of passes for code that never
+compiled. That happened once during this work.
+
+**What the BMS cannot tell you, and why no setting will fix it:** the Pylontech
+LV CAN protocol carries pack-level values only — 0x351 limits, 0x355 SOC/SOH,
+0x356 voltage/current/temperature, 0x359 alarm bitfields. **Per-cell voltages
+and per-module temperatures are not in the spec at all**, which is why
+`bmsMinU`/`bmsMaxU` read 0 and `bmsMinTemp`/`bmsMaxTemp` read -273. Those
+SolisCloud fields exist for other battery protocols. Don't chase them through
+inverter settings or firmware.
+
+`batteryFailureInformation01`/`02` and `batteryAlarm` looked like the 0x359
+bytes, whose bit map is published (byte 1 bit 4 = cell imbalance, bit 3 = BMS
+internal error), and were briefly written up here as "worth logging". **They are
+dead.** Measured during an active Batt_Comm_FAIL on 2 Sep, all three still read
+`"0"`. Now observed in both conditions, they are the `alarmCount` trap exactly.
+Don't build on them.
+
+**What does work, measured in both conditions on 2 Sep:** `bmsState` flips
+0 → 1 and `bmsBmsState` 3 → 0 when the link drops. `batteryChargingCurrent`
+goes 50 → 0, so it is not the static nameplate it looked like while healthy.
+None is used for detection — `BatteryLink` infers it from station/detailMix
+instead, because all of these live behind the /inverter/detail throttle.
+
+### A silent BMS is not a flat battery
+
+When the inverter loses its comms link to the pack, **every BMS-sourced field in
+the API collapses to zero at once** while the inverter's own DC meter keeps
+reading. Captured live during an active Batt_Comm_FAIL, 2 Sep 09:10:
+
+| | healthy (1 Sep) | during the fault |
+|---|---|---|
+| `batteryPercent` / `batteryCapacitySoc` | 60 | **0** |
+| `batteryVoltage` (BMS) | 53.16 | **0** |
+| `bstteryCurrent` | 7.7 | **0** |
+| `batteryHealthSoh` | 96 | **0** |
+| `batteryChargingCurrent` | 50 | **0** |
+| `batteryDischargeLimiting` | 100 | **0** |
+| `bmsBmsState` | 3 | **0** |
+| `bmsState` | 0 | **1** |
+| **`storageBatteryVoltage`** (inverter's own meter) | 53.4 | **52.8** |
+| `batteryUvpSet` / `batteryFcvSet` (inverter settings) | 42.0 / 53.5 | 42.0 / 53.5 |
+
+Before this was handled the app rendered a dead sensor as a flat battery: 0%,
+red, flagged critically low, with a runtime estimate to match — on a pack
+sitting at 52.8 V.
+
+`BatteryLink.isSilent` separates the two. **SOC 0 is the tell**: the inverter
+stops discharging at `socDischargeSet` (15% here), so a genuine zero is not
+reachable in normal operation. `storageBatteryVoltage` corroborates, and
+`batteryUvpSet` is the reference because it is the *inverter's* own setting and
+was verified to survive the fault intact while the BMS fields around it went to
+zero.
+
+**Inferred from station/detailMix on purpose.** The alarm list names this fault
+explicitly and `bmsState` marks it too, but both sit behind the /alarm/list and
+/inverter/detail throttle — up to 8 minutes at a 240 s interval, all of it
+showing a false 0%. detailMix is fetched every poll and costs nothing extra.
+
+The only surviving path to a displayed 0% is a pack that is present and
+genuinely collapsed below the cut-off. Every degraded input — no voltage field,
+zero voltage (a NO-Battery condition, reasoned rather than measured), setpoints
+not yet fetched — resolves to "unreadable" rather than to a charge state.
+
+What changes while silent: the tile and menu bar read `—`, the symbol becomes
+`antenna.radiowaves.left.and.right.slash` (not `battery.0percent`, which still
+asserts a charge level; `battery.slash` does not exist), `batteryLow` stays
+false so the fault never spends the low-battery red, the runtime estimate is
+suppressed, `checkBatteryAlerts` is skipped outright, and the full-charge
+tracker records nothing.
+
+**The adaptive slot machine holds rather than swaps.** A silent BMS reports 0%
+*and* 0 kW, which reads as "low and not discharging" — exactly the condition
+that hands slot 2 to grid. The dead bands cannot help, because the placeholder
+sits far outside them. Verified with a 20-case proxy including the measured
+healthy and fault samples.
+
 ### Sun times and daylight
 
 `Util.sunTimes` — NOAA approximation from the station's `latitude`/`longitude`
@@ -333,6 +514,12 @@ last reading indefinitely, and every number looked live while hours old.
 - **Assuming API units are consistent.** `monthEnergy` is kWh while
   `yearEnergy` is MWh. The day comparison refuses to compute unless the unit
   strings match.
+- **Rendering a placeholder as a reading.** A silent BMS returns 0 for every
+  battery field, and the app showed 0%, in red, flagged critically low, with a
+  runtime estimate — on a pack at 52.8 V. The general form: a field that is 0
+  because nothing measured it looks exactly like a field that is 0 because the
+  thing it measures is 0. Ask what the *other* instruments say before believing
+  a zero. See `BatteryLink`.
 - **A fallback message that assumes one cause.** "Set capacity in Preferences"
   appeared whenever there was no estimate, including when the battery was
   merely idle on a fully configured app.

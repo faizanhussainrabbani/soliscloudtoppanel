@@ -23,6 +23,8 @@ final class SolisSettings: ObservableObject {
         static let batteryCapacity  = "battery-capacity-kwh"
         static let batteryReserve   = "battery-reserve-soc"
         static let signingSecret    = "api-signing-secret"
+        static let socDayPeaks      = "battery-soc-day-peaks"
+        static let voltageDayPeaks  = "battery-voltage-day-peaks"
     }
 
     private init() {
@@ -106,6 +108,70 @@ final class SolisSettings: ObservableObject {
         get { defaults.string(forKey: Key.signingSecret) ?? "" }
         set { setString(Key.signingSecret, newValue) }
     }
+
+    /// Highest battery SOC seen on each station-local day, keyed "yyyy-MM-dd".
+    ///
+    /// Exists to answer one question the API cannot: when did the pack last
+    /// reach a full charge? LiFePO4 relies on periodically topping out so the
+    /// BMS can balance cells and re-anchor its SOC estimate, and this system
+    /// rides through roughly five grid outages a day, so the top of charge is
+    /// not something that can be assumed.
+    ///
+    /// Recorded locally because SolisCloud offers no history for it. Every
+    /// day-level endpoint tried (`/station/day`, `/inverter/day`,
+    /// `/battery/pile/chart` and five siblings) answers 404, so there is
+    /// nothing to backfill from and the record necessarily starts at first run
+    /// — which is why the UI distinguishes "no full charge" from "not enough
+    /// history to say".
+    ///
+    /// Pruned to `maxRetainedDays` on write. Plain [String: Double] keeps it
+    /// plist-native, and 90 dates cost well under 2 KB.
+    var socDayPeaks: [String: Double] {
+        get { dayPeaks(Key.socDayPeaks) }
+        set { setDayPeaks(Key.socDayPeaks, newValue) }
+    }
+
+    /// Highest pack voltage seen on each station-local day, keyed the same way.
+    ///
+    /// The companion to `socDayPeaks`, and the reason the pair exists: the
+    /// BMS's SOC is coulomb-counted and can drift to 100% while the pack sits
+    /// at the float setpoint, never rising towards absorption — and LFP cells
+    /// only balance near the top of the voltage curve. SOC alone therefore
+    /// cannot distinguish "topped out and balanced" from "the counter reached
+    /// 100". Peak voltage can.
+    ///
+    /// Sampled from `storageBatteryVoltage` in station/detailMix, so this costs
+    /// no extra request. That field is the *inverter's* measurement rather than
+    /// the BMS's `batteryVoltage`, deliberately: it is compared against
+    /// batteryAcvSet/batteryFcvSet, which are the inverter's own setpoints, and
+    /// the two meters read ~0.2 V apart. Same reference frame on both sides.
+    var voltageDayPeaks: [String: Double] {
+        get { dayPeaks(Key.voltageDayPeaks) }
+        set { setDayPeaks(Key.voltageDayPeaks, newValue) }
+    }
+
+    private func dayPeaks(_ key: String) -> [String: Double] {
+        defaults.dictionary(forKey: key) as? [String: Double] ?? [:]
+    }
+
+    private func setDayPeaks(_ key: String, _ newValue: [String: Double]) {
+        var trimmed = newValue
+        if trimmed.count > Self.maxRetainedDays {
+            // ISO-8601 dates sort lexically, so dropping the lowest keys drops
+            // the oldest days.
+            for stale in trimmed.keys.sorted().prefix(trimmed.count - Self.maxRetainedDays) {
+                trimmed.removeValue(forKey: stale)
+            }
+        }
+        guard trimmed != dayPeaks(key) else { return }
+        objectWillChange.send()
+        defaults.set(trimmed, forKey: key)
+        changed.send()
+    }
+
+    /// Long enough to answer "not in the last three weeks" with room to spare,
+    /// short enough that the record never grows without bound.
+    private static let maxRetainedDays = 90
 
     /// Hidden diagnostic with no UI, read fresh on every poll:
     ///

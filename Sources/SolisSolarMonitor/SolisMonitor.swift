@@ -45,6 +45,9 @@ struct DisplayState {
     var batterySymbol   = "battery.100percent"
     /// Drives the one piece of semantic colour in the summary.
     var batteryLow      = false
+    /// False while the BMS comms link is down and every battery figure the API
+    /// returns is a placeholder rather than a reading. See `BatteryLink`.
+    var batteryReporting = true
     /// Adds a small bolt beside the battery glyph, in the window and the menu
     /// bar alike — the level symbol can't carry charging on its own.
     var batteryCharging = false
@@ -109,6 +112,17 @@ struct DisplayState {
     /// capacity prompt for both, which read as an error on a correctly
     /// configured app whenever the battery was simply idle.
     var batteryCapacityUnset = true
+    /// "Today", "3 days ago · 81% today", or "Tracking — 4 days so far".
+    ///
+    /// When the pack last topped out, which matters because LiFePO4 balances
+    /// its cells and re-anchors its SOC estimate at the top of charge. nil only
+    /// when the reading carried no SOC at all.
+    var fullChargeText: String?
+    /// A full charge inside `FullCharge.recentDays`. Drives the icon under the
+    /// same rule as every other row — lit when the thing it stands for is
+    /// happening, dim when it isn't — rather than introducing a third colour
+    /// meaning alongside low-battery red and stale-data amber.
+    var fullChargeRecent = false
     /// nil on the first of the month, or when the API's period units don't
     /// match — see solarComparison.
     var solarComparisonText: String?
@@ -359,7 +373,8 @@ final class SolisMonitor: ObservableObject {
         let dayEnergy   = data.num("dayEnergy") ?? 0
         let dayEnergyStr = data.str("dayEnergyStr") ?? "kWh"
 
-        let batterySOC      = data.num("batteryPercent") ?? 0
+        let batterySOCReported = data.num("batteryPercent")
+        let batterySOC      = batterySOCReported ?? 0
         let batteryPowerKW  = data.num("batteryPowerV2") ?? 0
         let batteryPowerStr = data.str("batteryPowerStrV2") ?? "kW"
 
@@ -441,17 +456,39 @@ final class SolisMonitor: ObservableObject {
         // The slot state machine runs on every sample regardless of the
         // active mode, so switching *to* adaptive shows the right metrics
         // immediately instead of spending confirmPolls settling.
-        updateAdaptiveSlots(pvPower: pvPower, batterySOC: batterySOC, batteryPowerKW: batteryPowerKW)
+        // Decided before anything reads it, for the same reason gridOutageNow
+        // is: four separate sections below change behaviour on it, and one of
+        // them is the adaptive state machine, which would otherwise latch on a
+        // reading that isn't real.
+        let batterySilent = BatteryLink.isSilent(
+            soc: batterySOC,
+            packVoltage: data.num("storageBatteryVoltage"),
+            underVoltageSet: inverterDetail?.underVoltageSet)
+        next.batteryReporting = !batterySilent
+
+        updateAdaptiveSlots(pvPower: pvPower, batterySOC: batterySOC,
+                            batteryPowerKW: batteryPowerKW,
+                            batteryReadable: !batterySilent)
 
         // Low battery swaps 🔋 for 🪫 everywhere the battery is shown. Computed
         // here, once, rather than at each of the four use sites — the panel and
         // the popup showing different icons for one reading is exactly the kind
         // of contradiction this project has already been bitten by twice.
-        let battIcon = batteryIcon(for: batterySOC)
+        let battIcon = batterySilent ? "🔋" : batteryIcon(for: batterySOC)
         next.batteryIcon = battIcon
-        next.batterySymbol = batterySymbol(for: batterySOC, powerKW: batteryPowerKW)
-        next.batteryLow = batterySOC < BatteryAlert.lowIconSOC
-        next.batteryCharging = batteryPowerKW > Adaptive.powerFloor
+        // A link-down glyph, not a level glyph. Every level symbol — including
+        // battery.0percent — asserts a charge state, and asserting one from a
+        // placeholder is the whole bug. `battery.slash` does not exist (checked
+        // with NSImage), and the antenna symbol says the true thing anyway: the
+        // pack is there, the link isn't.
+        next.batterySymbol = batterySilent
+            ? "antenna.radiowaves.left.and.right.slash"
+            : batterySymbol(for: batterySOC, powerKW: batteryPowerKW)
+        // Never red on a reading that doesn't exist. The low-battery colour is
+        // one of only two semantic colours in the window, and spending it on a
+        // dead sensor teaches the reader to discount it.
+        next.batteryLow = !batterySilent && batterySOC < BatteryAlert.lowIconSOC
+        next.batteryCharging = !batterySilent && batteryPowerKW > Adaptive.powerFloor
 
         // Segments are the rendered form; panelText is the same content as a
         // string, kept for the log line and panel-debug-tick. Both are built
@@ -474,7 +511,7 @@ final class SolisMonitor: ObservableObject {
         let loadSeg    = PanelSegment(symbol: "house", text: "\(toFixed(loadKW, 2)) kW")
         let batterySeg = PanelSegment(symbol: next.batterySymbol,
                                       accessorySymbol: next.batteryCharging ? "bolt.fill" : nil,
-                                      text: "\(jsNum(batterySOC))%")
+                                      text: batterySilent ? "—" : "\(jsNum(batterySOC))%")
 
         var segments: [PanelSegment]
         switch settings.panelDisplayMode {
@@ -592,7 +629,9 @@ final class SolisMonitor: ObservableObject {
         next.solarAsleep = pvPower <= Adaptive.powerFloor
         next.solarTodayZero = dayEnergy <= 0
         next.loadIdle = loadKW <= Adaptive.powerFloor
-        next.batteryIdle = abs(batteryPowerKW) <= Adaptive.powerFloor
+        // Dim while silent too: the dim rule means "this metric isn't doing
+        // anything", and an unreadable one certainly isn't showing that it is.
+        next.batteryIdle = batterySilent || abs(batteryPowerKW) <= Adaptive.powerFloor
         next.gridIdle = abs(gridKW) <= GridFlow.directionFloorKW
         next.solarTodayText = energyText(dayEnergy, dayEnergyStr)
 
@@ -609,16 +648,23 @@ final class SolisMonitor: ObservableObject {
                                                    solarAsleep: next.solarAsleep)
 
         // 4. Battery
-        next.batterySOC = "\(jsNum(batterySOC))%"
-        if batteryPowerKW < -0.01 {
+        next.batterySOC = batterySilent ? "—" : "\(jsNum(batterySOC))%"
+        if batterySilent {
+            // Says what is actually true. "Idle" would be a claim about the
+            // pack, and 0.00 kW a claim about its flow; neither is known.
+            next.batteryFlowText = "Not reporting"
+        } else if batteryPowerKW < -0.01 {
             next.batteryFlowText = "Discharging \(toFixed(abs(batteryPowerKW), 2)) \(batteryPowerStr)"
         } else if batteryPowerKW > 0.01 {
             next.batteryFlowText = "Charging \(toFixed(batteryPowerKW, 2)) \(batteryPowerStr)"
         } else {
             next.batteryFlowText = "Idle"
         }
-        let runtime = batteryRuntimeHours(socPercent: batterySOC, powerKW: batteryPowerKW,
-                                          gridOutage: gridOutageNow)
+        // No estimate from a placeholder SOC — it would read "about 0 m left"
+        // on a pack sitting at 52.8 V.
+        let runtime = batterySilent ? nil
+            : batteryRuntimeHours(socPercent: batterySOC, powerKW: batteryPowerKW,
+                                  gridOutage: gridOutageNow)
         next.batteryTimeText = runtime.map { "about \(durationText($0.hours)) \($0.suffix)" }
         next.batteryEndTimeText = runtime.map { clockTime(inHours: $0.hours) }
         next.batteryEndLabel = runtime?.endLabel ?? "On battery until"
@@ -665,6 +711,31 @@ final class SolisMonitor: ObservableObject {
             next.inverterTempText = next.inverterTempHot
                 ? "\(toFixed(temperature, 0)) °C · limit \(Int(Thermal.shutdownCelsius)) °C"
                 : "\(toFixed(temperature, 0)) °C"
+        }
+
+        // Full charge, tracked locally — see FullCharge and settings.socDayPeaks.
+        //
+        // Only recorded when the response actually carried batteryPercent. A
+        // missing field reads as 0 through the `?? 0` above, and writing that
+        // as a day's peak would manufacture a record day with no battery data
+        // in it, which is exactly the evidence the "None in N days" wording
+        // leans on.
+        // `batterySilent` excluded as well as an absent field: recording a 0
+        // peak would add a day to the record with no battery data in it, and
+        // "None in N recorded days" leans on that count as evidence.
+        if let soc = batterySOCReported, !batterySilent {
+            let zoneOffsetSeconds = Int((data.num("timeZone") ?? 0) * 3600)
+            let readingInstant = data.num("dataTimestamp")
+                .map { Date(timeIntervalSince1970: $0 / 1000) } ?? Date()
+            let fullCharge = recordFullCharge(
+                soc: soc,
+                packVoltage: data.num("storageBatteryVoltage"),
+                reading: readingInstant,
+                utcOffsetSeconds: zoneOffsetSeconds,
+                floatVoltage: inverterDetail?.floatVoltage,
+                absorptionVoltage: inverterDetail?.absorptionVoltage)
+            next.fullChargeText = fullCharge.text
+            next.fullChargeRecent = fullCharge.recent
         }
 
         // Alarms, from the previous /alarm/list result.
@@ -763,11 +834,17 @@ final class SolisMonitor: ObservableObject {
         notifyAlarmChanges(stationName: stationName)
 
         // 7b. Low-battery notifications while the battery is under load.
-        checkBatteryAlerts(
-            batterySOC: batterySOC,
-            batteryPowerKW: batteryPowerKW,
-            stationName: stationName
-        )
+        // Skipped outright while the link is down. The 100 W draw gate already
+        // suppresses these (a silent BMS reports 0 flow as well as 0 SOC), but
+        // relying on one guard to cover a case it was not written for is how
+        // the next change breaks it.
+        if !batterySilent {
+            checkBatteryAlerts(
+                batterySOC: batterySOC,
+                batteryPowerKW: batteryPowerKW,
+                stationName: stationName
+            )
+        }
 
         // Kicked off, not awaited: a slow or unreachable forecast must never
         // hold up the reading the window is about to show.
@@ -796,6 +873,110 @@ final class SolisMonitor: ObservableObject {
         static let warnCelsius = 100.0
     }
 
+    /// Tells "the battery is empty" apart from "the battery can't be read".
+    ///
+    /// Measured during a live Batt_Comm_FAIL on 2 Sep: every BMS-sourced field
+    /// collapses to zero at once — `batteryPercent`, `batteryVoltage`,
+    /// `bstteryCurrent`, `batteryHealthSoh`, `batteryChargingCurrent`,
+    /// `batteryDischargeLimiting`, `bmsBmsState` — while the inverter's own DC
+    /// meter carried on reading 52.8 V. The pack was fine; only the link was
+    /// dead. Without this the app renders a dead sensor as a flat battery: 0%,
+    /// red, flagged critically low.
+    ///
+    /// Deliberately inferred from station/detailMix, which is fetched every
+    /// poll, rather than from the alarm list or `bmsState` — both live behind
+    /// the /alarm/list and /inverter/detail throttle and would leave the panel
+    /// showing a false 0% for up to 8 minutes at the user's interval.
+    private enum BatteryLink {
+        static func isSilent(soc: Double, packVoltage: Double?,
+                             underVoltageSet: Double?) -> Bool {
+            // SOC 0 is the tell. It is not otherwise reachable: the inverter
+            // stops discharging at socDischargeSet (15% here), so a genuine
+            // zero cannot occur in normal operation.
+            guard soc == 0 else { return false }
+            // No voltage field to corroborate with: SOC alone still beats
+            // inventing a charge state.
+            guard let packVoltage else { return true }
+            // No terminal voltage at all. Reasoned, not measured — there is no
+            // captured sample of a NO-Battery (1055) event: the inverter is
+            // seeing no pack rather than a flat one, and "0%" would assert a
+            // charge state for a battery that isn't there.
+            guard packVoltage > 0 else { return true }
+            // The inverter's configured under-voltage cut-off is its own
+            // setting, not BMS data, and was verified to survive the fault
+            // intact (42.0 V during the outage above). Above it the pack is
+            // not empty by the inverter's own definition.
+            guard let underVoltageSet, underVoltageSet > 0 else { return true }
+            // The one surviving path to a displayed 0%: a pack that is present
+            // and genuinely collapsed below the cut-off.
+            return packVoltage > underVoltageSet
+        }
+    }
+
+    private enum FullCharge {
+        /// What counts as topped out.
+        ///
+        /// 100, not the 98 that `Curtailment.fullSOC` uses. Those answer
+        /// different questions and the difference is deliberate: curtailment
+        /// asks "is the pack full enough that the inverter is throttling the
+        /// array", where 98 is close enough to matter; this asks "did the pack
+        /// actually reach the top of charge, where the BMS balances", and a
+        /// charge that stops at 98 is precisely the one that didn't.
+        static let fullSOC = 100.0
+
+        /// SOC required *alongside* voltage evidence of absorption.
+        ///
+        /// Looser than `fullSOC` on purpose. When SolisCloud's SOC came from
+        /// the BMS it was coulomb-counted and demanding a clean 100 was fair.
+        /// Since support switched the inverter to "51.2V Lithium Battery
+        /// (Without COMM)" it is inferred from pack voltage instead, and its
+        /// error is a few points either way — observed reading a spurious 100
+        /// on 2 Sep during a BMS re-init, and 99 on 6 Sep on a day the pack
+        /// demonstrably reached 55.0 V. Requiring exactly 100 let that soft
+        /// estimate veto hard voltage evidence, and the row claimed "2 days
+        /// ago" on the morning after a real absorption charge.
+        ///
+        /// 95 absorbs the observed drift while still rejecting the case the
+        /// SOC check is actually there for: terminal voltage lifted over the
+        /// threshold by a heavy charge current mid-way up the pack, which is
+        /// tens of points short, not five.
+        static let nearFullSOC = 95.0
+
+        /// A full charge inside this many days counts as current, and lights
+        /// the icon. Weekly is the commonly cited cadence for letting an LFP
+        /// pack balance, so a week is the natural boundary.
+        static let recentDays = 7
+
+        /// Days of record required before the app will report the *absence* of
+        /// a full charge as a fact about the battery.
+        ///
+        /// Below this it reports how long it has been watching instead. There
+        /// is no history to backfill from — every day-level SolisCloud endpoint
+        /// tried returns 404 — so a fresh install genuinely cannot tell "this
+        /// pack never tops out" from "I have only been running since Tuesday",
+        /// and stating the first on the evidence for the second is the
+        /// assume-one-cause bug this project has shipped before.
+        static let minimumRecordDays = 14
+
+        /// Peak pack voltage above which a day counts as having entered
+        /// absorption, i.e. driven the cells high enough to balance.
+        ///
+        /// The midpoint between the float and absorption setpoints, rather
+        /// than a constant or "within X of absorption". Self-scaling, and
+        /// unambiguous in the way that matters: float actively holds the pack
+        /// at `float`, so a pack cannot drift halfway to absorption by
+        /// accident — clearing the midpoint means the inverter deliberately
+        /// pushed it there.
+        ///
+        /// nil when the setpoints aren't known yet (they arrive on the
+        /// throttled /inverter/detail fetch), and callers then fall back to
+        /// SOC alone rather than assuming either answer.
+        static func absorptionThreshold(float: Double?, absorption: Double?) -> Double? {
+            guard let float, let absorption, float > 0, absorption > float else { return nil }
+            return (float + absorption) / 2
+        }
+    }
+
     private enum AlarmPolling {
         /// Polls to skip between alarm checks while the system is clear. At the
         /// 240 s interval that's a worst-case 8 minutes to notice a new alarm,
@@ -806,6 +987,134 @@ final class SolisMonitor: ObservableObject {
         /// station reads to piggyback on", and the cost scales with the poll
         /// rate exactly as intended.
         static let quietPollGap = 2
+    }
+
+    // MARK: - Full charge tracking
+
+    /// Raises today's high-water SOC and pack-voltage marks, and describes the
+    /// last genuine full charge.
+    ///
+    /// The whole feature exists because SolisCloud reports the battery's
+    /// *present* state and nothing about its history, while the question that
+    /// matters for pack health is a historical one. An LFP pack balances its
+    /// cells and re-anchors the BMS's SOC estimate at the top of charge; a
+    /// system that rides through five grid outages a day may go weeks without
+    /// getting there, and neither the app nor the vendor's own site would say
+    /// so.
+    ///
+    /// **Two marks, not one, and that is the point.** SOC is coulomb-counted
+    /// and drifts, so it can creep to 100% while the pack sits at the float
+    /// setpoint and the cells never rise far enough to balance. Peak voltage is
+    /// the physical evidence; SOC alone cannot tell a real top-of-charge from a
+    /// counter reaching its ceiling. Observed live on this system: SOC read 97%
+    /// with the pack at 53.52 V, i.e. exactly `batteryFcvSet`, 2.6 V under
+    /// absorption.
+    ///
+    /// Returns the row's text — nil when the pack genuinely topped out today,
+    /// which hides the row — and whether that top-out is recent enough to light
+    /// the icon.
+    ///
+    /// Hidden on the day of a full charge because "Full charge: Today" is the
+    /// one answer that asks nothing of the reader, and a row that says the same
+    /// thing every day stops being read at all — so it would be invisible on
+    /// the day it finally said "9 days ago". Same reasoning as the status line
+    /// at the top of the window, which is empty unless something needs
+    /// attention.
+    ///
+    /// Deliberately *not* hidden for the whole `recentDays` window. Any gap is
+    /// worth seeing while it is still small; suppressing it for a week means it
+    /// reappears at day eight with no sense of whether it is drifting or was
+    /// fine yesterday. The recording continues regardless of what is shown.
+    private func recordFullCharge(soc: Double, packVoltage: Double?, reading: Date,
+                                  utcOffsetSeconds: Int,
+                                  floatVoltage: Double?,
+                                  absorptionVoltage: Double?) -> (text: String?, recent: Bool) {
+        let today = stationDayKey(reading, utcOffsetSeconds: utcOffsetSeconds)
+
+        // High-water only, both marks. Two polls in the same day never lower a
+        // mark, so an afternoon discharge can't erase a morning's full charge.
+        var socPeaks = settings.socDayPeaks
+        if soc > (socPeaks[today] ?? -1) {
+            socPeaks[today] = soc
+            settings.socDayPeaks = socPeaks
+        }
+        var voltagePeaks = settings.voltageDayPeaks
+        if let packVoltage, packVoltage > 0, packVoltage > (voltagePeaks[today] ?? -1) {
+            voltagePeaks[today] = packVoltage
+            settings.voltageDayPeaks = voltagePeaks
+        }
+
+        let threshold = FullCharge.absorptionThreshold(float: floatVoltage,
+                                                       absorption: absorptionVoltage)
+
+        /// Did the pack actually reach the top of charge on this day?
+        func toppedOut(_ day: String) -> Bool {
+            let socPeak = socPeaks[day] ?? 0
+            // Voltage leads when it is available, because voltage is the thing
+            // that actually matters: LFP cells balance near the top of the
+            // voltage curve, not at a percentage. SOC stays on as
+            // corroboration rather than as a gate — see nearFullSOC.
+            //
+            // Two exemptions send us to the SOC-only fallback below. Setpoints
+            // not yet known (they arrive on the throttled /inverter/detail
+            // fetch), and a day with no voltage record: absence of the evidence
+            // is not evidence that the day's charge was incomplete, and
+            // demoting it retroactively would fabricate a gap that never
+            // happened.
+            //
+            // The first day of voltage tracking is exempt too, and that is not
+            // a nicety. Recording starts mid-day, so that day's peak covers
+            // only the hours after the app first ran — on a pack that absorbed
+            // at 11:00 and was back at float by 16:00, the mark reads ~53 V and
+            // the day gets demoted on evidence that simply wasn't collected.
+            // That would make the feature's first impression a false alarm,
+            // which is the assume-one-cause failure this codebase keeps
+            // relearning. Derived from the earliest key rather than stored: the
+            // oldest day in the record is exactly the partial one.
+            if let threshold, let peak = voltagePeaks[day],
+               day > (voltagePeaks.keys.min() ?? day) {
+                return peak >= threshold && socPeak >= FullCharge.nearFullSOC
+            }
+            // One instrument only, so demand the full 100 from it.
+            return socPeak >= FullCharge.fullSOC
+        }
+
+        let socPeakToday = socPeaks[today] ?? soc
+        // The interesting failure: the counter hit its ceiling but the pack
+        // never rose. Named for what it means rather than shown as a raw
+        // voltage, because "53.6 V" only informs a reader who already knows the
+        // 56.1 V setpoint.
+        let countedOnly = socPeakToday >= FullCharge.fullSOC && !toppedOut(today)
+        let todaySuffix = countedOnly
+            ? " · \(jsNum(FullCharge.fullSOC))% by count only"
+            : " · \(jsNum(socPeakToday))% today"
+
+        let fullDays = socPeaks.keys.filter(toppedOut).sorted()
+
+        // Note the gap is measured in calendar days, not in days observed: if
+        // the Mac was asleep for three of them, "5 days ago" is still exactly
+        // when the pack last topped out.
+        if let last = fullDays.last, let gap = dayGap(from: last, to: today) {
+            let recent = gap <= FullCharge.recentDays
+            switch gap {
+            case ..<1:  return (nil, recent)     // topped out today: nothing to say
+            case 1:     return ("Yesterday" + todaySuffix, recent)
+            default:    return ("\(gap) days ago" + todaySuffix, recent)
+            }
+        }
+
+        // Never seen one. How much that means depends entirely on how long the
+        // record is, and the record cannot be backfilled — so below the
+        // threshold the row reports the record's length rather than making a
+        // claim about the battery. Counting observed days rather than the span
+        // from the first entry, because a fortnight with the Mac switched off
+        // is not a fortnight of evidence.
+        let recordDays = socPeaks.count
+        guard recordDays >= FullCharge.minimumRecordDays else {
+            let plural = recordDays == 1 ? "day" : "days"
+            return ("Tracking — \(recordDays) \(plural) so far", false)
+        }
+        return ("None in \(recordDays) recorded days" + todaySuffix, false)
     }
 
     // MARK: - Alarms
@@ -1445,7 +1754,9 @@ final class SolisMonitor: ObservableObject {
     }
 
     /// Decides what each adaptive slot shows, with hysteresis on both.
-    private func updateAdaptiveSlots(pvPower: Double, batterySOC: Double, batteryPowerKW: Double) {
+    private func updateAdaptiveSlots(pvPower: Double, batterySOC: Double,
+                                     batteryPowerKW: Double,
+                                     batteryReadable: Bool = true) {
         // Slot 1. Solar reclaims the slot as soon as it clears solarWake;
         // giving it up requires confirmPolls consecutive samples at or below
         // the noise floor. Readings in between hold the current slot rather
@@ -1465,11 +1776,17 @@ final class SolisMonitor: ObservableObject {
         // Slot 2. Grid takes over only while the battery is low *and* not
         // being drawn from. The threshold it's compared against depends on
         // which metric is currently showing — that asymmetry is the dead band.
+        //
+        // A silent BMS reports 0% and 0 kW, which reads as "low and not
+        // discharging" — precisely the condition that hands the slot to grid.
+        // Holding instead keeps a comms fault from latching the panel into a
+        // state that a real reading never justified, and the dead bands cannot
+        // help here because the placeholder sits far outside them.
         let batteryLow = adaptiveShowingGrid
             ? batterySOC < Adaptive.socRestore
             : batterySOC <= Adaptive.socLow
         let discharging = batteryPowerKW < -Adaptive.powerFloor
-        let wantGrid = batteryLow && !discharging
+        let wantGrid = batteryReadable ? (batteryLow && !discharging) : adaptiveShowingGrid
 
         // First real sample: adopt both answers outright. Otherwise the panel
         // would open on whatever the initial state happens to be and take

@@ -143,6 +143,22 @@ enum SolisAPI {
         let gridVoltage: Double?
         let gridFrequency: Double?
         let currentState: String?
+        /// batteryAcvSet / batteryFcvSet — the absorption and float setpoints,
+        /// 56.1 V and 53.5 V on this system (3.506 and 3.344 V/cell at 16S).
+        ///
+        /// Carried so the full-charge row can tell a real top-of-charge from a
+        /// coulomb-counted 100%: LFP cells only balance when driven up towards
+        /// absorption, and a BMS can report 100% while the pack sits at float.
+        /// Static settings, so the throttled fetch is fine for them.
+        let absorptionVoltage: Double?
+        let floatVoltage: Double?
+        /// batteryUvpSet — the inverter's own under-voltage cut-off, 42 V here.
+        ///
+        /// Used to tell an empty pack from an unreadable one. Verified to
+        /// survive a live Batt_Comm_FAIL intact while every BMS-sourced field
+        /// around it collapsed to 0, which is exactly what makes it a usable
+        /// reference during the fault.
+        let underVoltageSet: Double?
     }
 
     static func fetchInverterDetail(inverterID: String, cookie: String, deviceID: String,
@@ -165,7 +181,10 @@ enum SolisAPI {
             internalTemperature: payload.num("inverterTemperature"),
             gridVoltage: payload.num("uAc1"),
             gridFrequency: payload.num("fac"),
-            currentState: payload.str("currentState")
+            currentState: payload.str("currentState"),
+            absorptionVoltage: payload.num("batteryAcvSet"),
+            floatVoltage: payload.num("batteryFcvSet"),
+            underVoltageSet: payload.num("batteryUvpSet")
         )
     }
 

@@ -285,6 +285,18 @@ struct MenuContentView: View {
                               ? .solisOffline
                               : tint(.solisBattery, live: !monitor.display.batteryIdle),
                           label: "Battery", value: monitor.display.batteryFlowText)
+            // When the pack last topped out. Filed under Equipment rather than
+            // Today because it is a fact about the battery's condition, like
+            // temperature below it, not a figure for the day just gone — and
+            // the row is deliberately about the top of charge only, so it can't
+            // be read as contradicting the curtailment caption's "battery
+            // full", which asks a different question at a different threshold.
+            if let fullCharge = monitor.display.fullChargeText {
+                DiagnosticRow(symbol: "battery.100percent.bolt",
+                              symbolColor: tint(.solisBattery,
+                                                live: monitor.display.fullChargeRecent),
+                              label: "Full charge", value: fullCharge)
+            }
             if let temp = monitor.display.inverterTempText {
                 DiagnosticRow(symbol: "thermometer.medium",
                               symbolColor: monitor.display.inverterTempHot ? .solisWarning : .solisDim,
